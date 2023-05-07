@@ -1,0 +1,227 @@
+import "hashes/sha256/512bitPadded.zok" as sha256;
+from "ecc/babyjubjubParams" import BabyJubJubParams;
+import "signatures/verifyEddsa.zok" as verifyEddsa;
+import "ecc/babyjubjubParams.zok" as context;
+import "utils/casts/u32_to_field" as u32_from_bits;
+
+struct SignedValue {
+    field[2] R;
+    field S;
+}
+
+struct PKey {
+    field[2] value;
+}
+
+struct RawCarbonFootprint {
+    u32[16] value;
+    u32[16] materialId;
+}
+
+struct RawRecipe{
+    u32[16] weights;
+    u32[16] materialIds;
+}
+
+
+def hashCarbonFootprint(RawCarbonFootprint rawValue) -> u32[16] {
+    u32[8] hashCFValues = sha256(rawValue.value[0..8], rawValue.value[8..16]);
+    u32[8] hashMaterialIds = sha256(rawValue.materialId[0..8], rawValue.materialId[8..16]);
+    return [...hashCFValues, ...hashMaterialIds];
+}
+
+
+// def hashRecipe(RawRecipe rawValue) -> u32[16] {
+
+//     u32[32][8] mut helper = [[0;8];32];
+//     for u32 i in 0..16 {
+//         helper[i] = sha256(rawValue.weights[(i*16)..(i*16+8)], rawValue.weights[(i*16+8)..(i*16+16)]);
+//         helper[16+i] = sha256(rawValue.materialIds[(i*16)..(i*16+8)], rawValue.materialIds[(i*16+8)..(i*16+16)]);
+//     }
+//     for u32 i in 0..8 {
+//         helper[i] = sha256(helper[i*2], helper[i*2+1]);
+//         helper[16+i] = sha256(helper[i*2+16], helper[i*2+17]);
+//     }
+//     for u32 i in 0..4 {
+//         helper[i] = sha256(helper[i*2], helper[i*2+1]);
+//         helper[16+i] = sha256(helper[i*2+16], helper[i*2+17]);
+//     }
+//     for u32 i in 0..2 {
+//         helper[i] = sha256(helper[i*2], helper[i*2+1]);
+//         helper[16+i] = sha256(helper[i*2+16], helper[i*2+17]);
+//     }
+
+//     return [
+//         ...sha256(helper[0], helper[1]),
+//         ...sha256(helper[16], helper[17])
+//     ];
+// }
+
+def hashRecipe(RawRecipe rawValue) -> u32[16] {
+    return [
+        ...sha256(rawValue.weights[0..8], rawValue.weights[8..16]), 
+        ...sha256(rawValue.materialIds[0..8], rawValue.materialIds[8..16])
+    ];
+}
+
+
+def checkSignature(BabyJubJubParams context, SignedValue sig, u32[16] hash, PKey key) -> bool {
+
+    return verifyEddsa(sig.R, sig.S, key.value, hash[0..8], hash[8..16], context);
+
+}
+
+def checkAllSignatureCarbonFootprints<N>(
+    BabyJubJubParams context,
+    SignedValue[N] signedCarbonFootprints,
+    u32[N][16] hashedCarbonFootprints,
+    PKey[N] auditors
+    ) -> bool {
+
+        bool mut result = true;
+        
+        for u32 i in 0..N {
+            bool isSignedCorrect = checkSignature(context, signedCarbonFootprints[i], hashedCarbonFootprints[i], auditors[i]) ? true : false;
+            log("{} valid signature: {}", u32_from_bits(i), isSignedCorrect);
+            result = result == isSignedCorrect;
+        }
+
+        return result;
+    }
+
+def hashAllCarbonFootprints<N>(
+    RawCarbonFootprint[N] rawInputs
+    ) -> u32[N][16] {
+        u32[N][16] mut result = [[0; 16]; N];
+        for u32 i in 0..N {
+            result[i] = hashCarbonFootprint(rawInputs[i]);
+        }
+        return result;
+    }
+
+def validateCarbonFootprints<N>(
+    BabyJubJubParams context,
+    RawCarbonFootprint[N] rawValues,
+    SignedValue[N] signedValues,
+    PKey[N] publicKeys
+    ) -> bool {
+    
+    u32[N][16] hashedCarbonFootprints = hashAllCarbonFootprints(rawValues);
+    
+    //check validity of signatures
+    bool verifiedSignatures = checkAllSignatureCarbonFootprints(
+        context, 
+        signedValues, 
+        hashedCarbonFootprints, 
+        publicKeys
+        );
+
+    return verifiedSignatures;
+    }
+
+def validateRecipe(
+    BabyJubJubParams context,
+    RawRecipe rawRecipe,
+    SignedValue signedRecipe,
+    PKey auditor
+    ) -> bool {
+
+        u32[16] hashedRecipe = hashRecipe(rawRecipe);
+        bool verifiedSignature = checkSignature(context, signedRecipe, hashedRecipe, auditor);
+
+        return verifiedSignature;
+    }
+
+def calculateOutput<K, N>(
+    RawRecipe[K] recipes,
+    RawCarbonFootprint[N] carbonFootprints
+    ) -> u32 {
+
+        u32[K*16] mut weights = [0;K*16];
+
+        for u32 i in 0..K*16 {
+            weights[i] = recipes[i/16].weights[i%16];
+        }
+
+        u32 mut result = 0;
+
+        for u32 i in 0..N {
+            log("{} + {} * {}", u32_from_bits(result), u32_from_bits(weights[i]), u32_from_bits(carbonFootprints[i].value[15]));
+            result = result + weights[i] * carbonFootprints[i].value[15];
+        }
+        return result;
+    }
+
+def checkMaterialIds<K, N>(
+    RawRecipe[K] recipes,
+    RawCarbonFootprint[N] carbonFootprints
+    ) -> bool {
+        
+        u32[K*16] mut recipeIds = [0;K*16];
+
+        for u32 i in 0..K*16 {
+            recipeIds[i] = recipes[i/16].materialIds[i%16];
+        }
+
+        bool mut result = true;
+        for u32 i in 0..N {
+
+            result = result == (recipeIds[i] == carbonFootprints[i].materialId[15]);
+        }
+
+        return result;
+
+    }
+
+def validateRecipes<N>(
+    BabyJubJubParams context,
+    RawRecipe[N] rawRecipes,
+    SignedValue[N] signedRecipes,
+    PKey[N] auditors
+    ) -> bool {
+        bool mut result = true;
+        for u32 i in 0..N {
+
+            result = result == validateRecipe(context, rawRecipes[i], signedRecipes[i], auditors[i]);
+        }
+
+        return result;
+    }
+
+def main(
+    private RawRecipe[1] rawRecipes,
+    private SignedValue[1] signedRecipes,
+    PKey[1] auditorsRecipe,
+    private RawCarbonFootprint[3] rawCarbonFootprints, 
+    private SignedValue[3] signedCarbonFootprints, 
+    PKey[3] auditorsCarbonFootprints
+    ) -> u32 {
+
+    //u32 arrayLength = 3;
+    //Create context for signature verifications
+	BabyJubJubParams context = context();
+
+    //log("Validating Recipe");
+    bool validRecipe = validateRecipes(context, rawRecipes, signedRecipes, auditorsRecipe);
+    assert(validRecipe);
+    log("Validation of recipe complete: {}", validRecipe);
+    
+    //check validty of carbon footprints
+    //log("Validating Signatures of Carbon Footprint values", 0);
+    bool validCF = validateCarbonFootprints(context, rawCarbonFootprints, signedCarbonFootprints, auditorsCarbonFootprints);
+    assert(validCF);
+    log("Validation of CF signatures complete: {}", validCF);
+
+    //log("Checking Material IDs", 0);
+    bool validMaterialIds = checkMaterialIds(rawRecipes, rawCarbonFootprints);
+    assert(validMaterialIds);
+    log("Check of Material IDs complete: {}", validMaterialIds);
+
+    u32 calculationResult = calculateOutput(rawRecipes, rawCarbonFootprints);
+    log("Result of carbon calculation: {}", u32_from_bits(calculationResult));
+
+
+    //log("value: {}", u32_from_bits(unsigned_input.value[15]));
+
+    return calculationResult;
+}
